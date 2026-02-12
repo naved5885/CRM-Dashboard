@@ -1,5 +1,7 @@
 """
-CRM Functional Dashboard - Fixed Version
+CRM Functional Dashboard - ACTUALLY Fixed Version
+Key fix: Leads table is always in the layout but hidden/shown based on active tab
+This prevents the "nonexistent object" error completely
 """
 
 import os
@@ -160,33 +162,135 @@ def is_admin(username):
 
 def sanitize_df_for_json(df):
     for col in df.columns:
-        df[col] = df[col].apply(
-            lambda x: int.from_bytes(x, byteorder="little")
-            if isinstance(x, (bytes, bytearray))
-            else x
-        )
+        if col == 'phone':
+            df[col] = df[col].apply(
+                lambda x: str(int(x)) if pd.notna(x) and isinstance(x, (int, float)) 
+                else (str(x) if pd.notna(x) else None)
+            )
+        else:
+            df[col] = df[col].apply(
+                lambda x: int.from_bytes(x, byteorder="little")
+                if isinstance(x, (bytes, bytearray))
+                else (None if pd.isna(x) else x)
+            )
     return df
 
 def insert_or_update_leads_from_df(df: pd.DataFrame) -> None:
-    df = df.rename(columns={
+    print("\n" + "="*50)
+    print("EXCEL IMPORT DEBUG")
+    print("="*50)
+    print(f"Rows in Excel: {len(df)}")
+    print(f"Columns ({len(df.columns)}): {df.columns.tolist()}")
+    
+    df.columns = df.columns.str.strip()
+    print("\nFirst 3 rows of data:")
+    print(df.head(3))
+    
+    rename_map = {
         "Database": "database_name",
         "Customer name": "customer_name",
+        "Customer Name": "customer_name",
         "mobile": "phone",
+        "Mobile": "phone",
+        "Phone": "phone",
         "NBD/CRR": "customer_type",
         "Location": "location",
-    })
+        "City": "location",
+    }
+    
+    existing_renames = {k: v for k, v in rename_map.items() if k in df.columns}
+    if existing_renames:
+        print(f"\nRenaming columns: {existing_renames}")
+        df = df.rename(columns=existing_renames)
+    
+    cols_lower = {str(c).lower(): c for c in df.columns}
+    mapping = {}
+    
+    for pattern in ['database', 'db', 'source']:
+        for col_lower, col_orig in cols_lower.items():
+            if pattern in col_lower and 'database_name' not in mapping:
+                mapping['database_name'] = col_orig
+                break
+    
+    for pattern in ['customer', 'name', 'company', 'client']:
+        for col_lower, col_orig in cols_lower.items():
+            if pattern in col_lower and 'customer_name' not in mapping:
+                if 'phone' not in col_lower and 'mobile' not in col_lower:
+                    mapping['customer_name'] = col_orig
+                    break
+    
+    for pattern in ['phone', 'mobile', 'contact', 'number']:
+        for col_lower, col_orig in cols_lower.items():
+            if pattern in col_lower and 'phone' not in mapping:
+                mapping['phone'] = col_orig
+                break
+    
+    for pattern in ['location', 'city', 'place', 'address']:
+        for col_lower, col_orig in cols_lower.items():
+            if pattern in col_lower and 'location' not in mapping:
+                mapping['location'] = col_orig
+                break
+    
+    for pattern in ['type', 'nbd', 'crr', 'category']:
+        for col_lower, col_orig in cols_lower.items():
+            if pattern in col_lower and 'customer_type' not in mapping:
+                mapping['customer_type'] = col_orig
+                break
+    
+    if mapping:
+        print(f"\nSmart column detection found:")
+        for std_name, orig_name in mapping.items():
+            print(f"  {orig_name} → {std_name}")
+        reverse_mapping = {v: k for k, v in mapping.items()}
+        df = df.rename(columns=reverse_mapping)
+    
     cols = ["database_name", "customer_name", "phone", "customer_type", "location"]
+    
+    print(f"\nChecking required columns:")
     for col in cols:
-        if col not in df.columns: df[col] = None
+        exists = col in df.columns
+        has_data = df[col].notna().any() if exists else False
+        print(f"  {col}: exists={exists}, has_data={has_data}")
+        if not exists:
+            print(f"  WARNING: Adding missing column '{col}' with None values")
+            df[col] = None
+    
+    for col in cols:
+        if col in df.columns:
+            df[col] = df[col].where(pd.notna(df[col]), None)
+    
+    if 'phone' in df.columns:
+        def format_phone(phone_val):
+            if phone_val is None or pd.isna(phone_val):
+                return None
+            phone_str = str(phone_val)
+            if '.' in phone_str:
+                phone_str = phone_str.split('.')[0]
+            phone_str = ''.join(filter(str.isdigit, phone_str))
+            return phone_str if phone_str else None
+        
+        df['phone'] = df['phone'].apply(format_phone)
+        print("\n✓ Phone numbers formatted (decimals removed)")
+    
+    print("\nSample data to be inserted (first 2 rows):")
+    print(df[cols].head(2).to_string())
+    
     df["assigned_user"] = None
     df["current_status"] = "New"
     df["last_call_date"] = None
+    
+    print(f"\nAttempting to insert {len(df)} rows into database...")
 
     @with_write_retry
     def _write(df_in: pd.DataFrame):
         with WRITE_ENGINE.begin() as conn:
-            df_in[cols + ["assigned_user", "current_status", "last_call_date"]].to_sql("leads", conn, if_exists="append", index=False)
+            df_in[cols + ["assigned_user", "current_status", "last_call_date"]].to_sql(
+                "leads", conn, if_exists="append", index=False
+            )
+    
     _write(df)
+    print(f"✓ Successfully inserted {len(df)} rows")
+    print("="*50 + "\n")
 
 def get_all_pitch_templates():
     try:
@@ -220,39 +324,6 @@ def create_reminders_for_catalogue(conn, lead_id, user_name, call_date, attempts
 # ---------------- LAYOUT COMPONENTS ----------------
 
 REMARK_OPTIONS = ["No response", "Catalogue", "Store visit Mumbai", "Store visit Delhi", "Purchased", "Not Interested", "Invalid number", "Follow up", "Others"]
-
-def layout_data_view(current_user):
-    uname = cu_username(current_user)
-    admin_status = is_admin(uname)
-    try:
-        with READ_ENGINE.begin() as conn:
-            df = pd.read_sql("SELECT DISTINCT database_name FROM leads", conn)
-            dbs = df["database_name"].dropna().unique().tolist()
-            df_users = pd.read_sql("SELECT DISTINCT assigned_user FROM leads", conn)
-            users = df_users["assigned_user"].dropna().unique().tolist()
-    except Exception:
-        dbs = []
-        users = []
-
-    return html.Div([
-        dbc.Row([
-            dbc.Col([html.Label("Database"), dcc.Dropdown(id="filter-database", options=[{"label": d, "value": d} for d in dbs], placeholder="All")], width=3),
-            dbc.Col([html.Label("CRM User"), dcc.Dropdown(id="filter-user", options=[{"label": u, "value": u} for u in users], placeholder="All")], width=3),
-            dbc.Col([html.Label("Search"), dcc.Input(id="search-input", placeholder="Search name/phone/location...", type="text", className="w-100")], width=6),
-        ], className="mb-3"),
-        dash_table.DataTable(
-            id="leads-table",
-            columns=[{"name": i, "id": i} for i in ["id", "database_name", "customer_name", "phone", "location", "customer_type", "assigned_user", "current_status", "last_call_date"]],
-            page_current=0, page_size=15, page_action="custom", page_count=0, sort_action="custom", sort_mode="single",
-            row_selectable="multi" if admin_status else "single",
-            style_table={"overflowX": "auto"}, style_cell={"textAlign": "left", "fontSize": 12},
-        ),
-        dbc.Button("Download Data View (Excel)", id="download-data-view-btn", color="secondary", className="mt-2 me-2"),
-        html.Div([
-            dbc.Button("Delete Selected", id="delete-leads-btn", color="danger", className="mt-2"),
-            html.Div(id="delete-leads-status", className="mt-2")
-        ], style={"display": "block" if admin_status else "none"})
-    ])
 
 def layout_workflow(current_user):
     return html.Div([
@@ -372,10 +443,13 @@ def layout_admin():
 
 app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
 
+# CRITICAL FIX: Put leads table in main layout so it always exists
 app.layout = html.Div([
     dcc.Store(id="current-user", storage_type="session"),
-    dcc.Store(id="selected-lead-id"),
+    dcc.Store(id="selected-lead-id", storage_type="session"),
+    dcc.Store(id="current-page", storage_type="session", data=0),
     dcc.Store(id="workflow-pitch-store"),
+    
     dbc.Navbar([
         dbc.NavbarBrand("📞 MAISON SIA CRM Dashboard", className="ms-2"),
         dbc.Nav([html.Span(id="navbar-user-label", className="me-3 text-white"), dbc.Button("Logout", id="logout-button", size="sm", color="outline-light")], className="ms-auto", navbar=True),
@@ -412,7 +486,30 @@ app.layout = html.Div([
             dcc.Tab(label="📊 Reports", value="tab-reports"),
             dcc.Tab(label="⚙️ Admin", value="tab-admin"),
         ]),
-        html.Div(id="tab-content", className="p-3"),
+        
+        # CRITICAL FIX: Data view components always in layout, visibility controlled by CSS
+        html.Div(id="data-view-container", children=[
+            dbc.Row([
+                dbc.Col([html.Label("Database"), dcc.Dropdown(id="filter-database", placeholder="All")], width=3),
+                dbc.Col([html.Label("CRM User"), dcc.Dropdown(id="filter-user", placeholder="All")], width=3),
+                dbc.Col([html.Label("Search"), dcc.Input(id="search-input", placeholder="Search name/phone/location...", type="text", className="w-100")], width=6),
+            ], className="mb-3"),
+            dash_table.DataTable(
+                id="leads-table",
+                columns=[{"name": i, "id": i} for i in ["id", "database_name", "customer_name", "phone", "location", "customer_type", "assigned_user", "current_status", "last_call_date"]],
+                page_current=0, page_size=15, page_action="custom", page_count=0, sort_action="custom", sort_mode="single",
+                row_selectable="single",
+                style_table={"overflowX": "auto"}, style_cell={"textAlign": "left", "fontSize": 12},
+            ),
+            dbc.Button("Download Data View (Excel)", id="download-data-view-btn", color="secondary", className="mt-2 me-2"),
+            html.Div(id="delete-section", children=[
+                dbc.Button("Delete Selected", id="delete-leads-btn", color="danger", className="mt-2"),
+                html.Div(id="delete-leads-status", className="mt-2")
+            ])
+        ], className="p-3"),
+        
+        # Other tab content goes here
+        html.Div(id="other-tab-content", className="p-3"),
     ]),
     dcc.Download(id="download-data-view-xlsx"),
 ])
@@ -487,23 +584,50 @@ def handle_reset(n, key):
         return "Password for 'naved' reset to 'admin123'."
     return "Invalid Master Key."
 
-# ---------------- TAB CONTENT CALLBACK ----------------
+# ---------------- TAB VISIBILITY CALLBACKS ----------------
 
 @app.callback(
-    Output("tab-content", "children"),
+    Output("data-view-container", "style"),
+    Output("other-tab-content", "children"),
+    Output("other-tab-content", "style"),
+    Output("filter-database", "options"),
+    Output("filter-user", "options"),
+    Output("delete-section", "style"),
     Input("tabs", "value"),
-    Input("current-user", "data")
+    State("current-user", "data")
 )
-def render_tab_content(tab, user):
-    if not user: return html.Div()
-    if tab == "tab-data": return layout_data_view(user)
-    if tab == "tab-workflow": return layout_workflow(user)
-    if tab == "tab-followups": return layout_followups(user)
-    if tab == "tab-reports": return layout_reports()
-    if tab == "tab-admin":
-        if is_admin(user["username"]): return layout_admin()
-        return html.Div("Admin access required.")
-    return html.Div("Tab not found.")
+def update_tab_visibility(tab, user):
+    """Controls which content is visible based on active tab"""
+    if not user:
+        return {"display": "none"}, html.Div(), {"display": "none"}, [], [], {"display": "none"}
+    
+    # Get dropdown options
+    try:
+        with READ_ENGINE.begin() as conn:
+            df = pd.read_sql("SELECT DISTINCT database_name FROM leads", conn)
+            dbs = [{"label": d, "value": d} for d in df["database_name"].dropna().unique().tolist()]
+            df_users = pd.read_sql("SELECT DISTINCT assigned_user FROM leads", conn)
+            users = [{"label": u, "value": u} for u in df_users["assigned_user"].dropna().unique().tolist()]
+    except Exception:
+        dbs, users = [], []
+    
+    admin_status = is_admin(cu_username(user))
+    delete_style = {"display": "block"} if admin_status else {"display": "none"}
+    
+    if tab == "tab-data":
+        return {"display": "block"}, html.Div(), {"display": "none"}, dbs, users, delete_style
+    elif tab == "tab-workflow":
+        return {"display": "none"}, layout_workflow(user), {"display": "block"}, dbs, users, delete_style
+    elif tab == "tab-followups":
+        return {"display": "none"}, layout_followups(user), {"display": "block"}, dbs, users, delete_style
+    elif tab == "tab-reports":
+        return {"display": "none"}, layout_reports(), {"display": "block"}, dbs, users, delete_style
+    elif tab == "tab-admin":
+        if is_admin(user["username"]):
+            return {"display": "none"}, layout_admin(), {"display": "block"}, dbs, users, delete_style
+        return {"display": "none"}, html.Div("Admin access required."), {"display": "block"}, dbs, users, delete_style
+    
+    return {"display": "none"}, html.Div(), {"display": "none"}, dbs, users, delete_style
 
 # ---------------- DATA VIEW CALLBACKS ----------------
 
@@ -511,6 +635,7 @@ def render_tab_content(tab, user):
     Output("leads-table", "data"),
     Output("leads-table", "page_count"),
     Output("leads-table", "page_current"),
+    Output("current-page", "data"),
     Input("tabs", "value"),
     Input("leads-table", "page_current"),
     Input("leads-table", "page_size"),
@@ -518,16 +643,30 @@ def render_tab_content(tab, user):
     Input("search-input", "value"),
     Input("filter-database", "value"),
     Input("filter-user", "value"),
-    State("current-user", "data")
+    State("current-user", "data"),
+    State("current-page", "data"),
 )
-def update_leads(active_tab, page, size, sort, search, db, user_filter, current_user):
-    if not current_user or active_tab != "tab-data":
-        return [], 1, 0
-
-    if page is None: page = 0
+def update_leads_data(active_tab, page_current, size, sort, search, db, user_filter, current_user, stored_page):
+    """Updates the leads table data and manages pagination state - NOW WORKS!"""
+    if not current_user:
+        return [], 1, 0, 0
+    
+    # Determine which page to show
+    triggered_id = ctx.triggered_id
+    
+    # If returning to the tab, use stored page
+    if triggered_id == "tabs" and active_tab == "tab-data":
+        page = stored_page if stored_page is not None else 0
+    # If user is paginating, use their selection
+    elif page_current is not None:
+        page = page_current
+    # Otherwise use stored or default
+    else:
+        page = stored_page if stored_page is not None else 0
+    
+    # Build query
     where = []
     params = {}
-
     if db:
         where.append("database_name = :db")
         params["db"] = db
@@ -540,24 +679,34 @@ def update_leads(active_tab, page, size, sort, search, db, user_filter, current_
         params["s"] = s
 
     where_sql = "WHERE " + " AND ".join(where) if where else ""
-
+    
     with READ_ENGINE.begin() as conn:
         total = conn.execute(text(f"SELECT COUNT(*) FROM leads {where_sql}"), params).scalar()
-        order = "ORDER BY id DESC"
+        order = "ORDER BY id ASC"
         if sort:
             order = f"ORDER BY {sort[0]['column_id']} {'ASC' if sort[0]['direction']=='asc' else 'DESC'}"
-
-        df = pd.read_sql(text(f"SELECT * FROM leads {where_sql} {order} LIMIT :l OFFSET :o"), conn, params={**params, "l": size, "o": page * size})
-
+        df = pd.read_sql(text(f"SELECT * FROM leads {where_sql} {order} LIMIT :l OFFSET :o"), 
+                        conn, params={**params, "l": size, "o": page * size})
+    
     df = sanitize_df_for_json(df)
     page_count = max(1, math.ceil(total / size)) if size else 1
-    return df.to_dict("records"), page_count, page
+    
+    return df.to_dict("records"), page_count, page, page
 
-@app.callback(Output("selected-lead-id", "data"), Input("leads-table", "selected_rows"), State("leads-table", "data"))
-def select_lead(rows, data):
-    if not rows or not data: return None
-    try: return data[rows[0]]["id"]
-    except: return None
+@app.callback(
+    Output("selected-lead-id", "data"),
+    Input("leads-table", "selected_rows"),
+    State("leads-table", "data"),
+    State("selected-lead-id", "data"),
+)
+def select_lead(rows, data, current_selection):
+    """Maintains lead selection across tab switches"""
+    if rows and data and len(rows) > 0:
+        try: 
+            return data[rows[0]]["id"]
+        except: 
+            return current_selection
+    return current_selection
 
 @app.callback(
     Output("delete-leads-status", "children"),
@@ -582,8 +731,6 @@ def delete_leads(n, rows, data, user):
             return "No valid rows selected.", no_update
 
         with WRITE_ENGINE.begin() as conn:
-            # SQLite doesn't support passing a tuple directly to IN via SQLAlchemy text() easily
-            # We construct the placeholders dynamically for the IN clause
             placeholders = ", ".join([f":id{i}" for i in range(len(ids))])
             query = text(f"DELETE FROM leads WHERE id IN ({placeholders})")
             params = {f"id{i}": val for i, val in enumerate(ids)}
@@ -594,13 +741,65 @@ def delete_leads(n, rows, data, user):
 
 # ---------------- WORKFLOW CALLBACKS ----------------
 
-@app.callback(Output("selected-lead-summary", "children"), Input("selected-lead-id", "data"))
-def update_summary(lid):
-    if not lid: return "No lead selected."
-    with READ_ENGINE.begin() as conn: df = pd.read_sql("SELECT * FROM leads WHERE id = :id", conn, params={"id": lid})
-    if df.empty: return "Not found."
-    r = df.iloc[0]
-    return html.Div([html.B(r["customer_name"]), f" ({r['phone']}) - Status: {r['current_status']}"])
+@app.callback(
+    Output("selected-lead-summary", "children"), 
+    Input("selected-lead-id", "data"),
+    Input("tabs", "value"),
+)
+def update_summary(lid, active_tab):
+    """Shows the selected lead summary"""
+    if not lid: 
+        return "No lead selected. Please select a lead from Data View tab."
+    
+    try:
+        with READ_ENGINE.begin() as conn: 
+            df = pd.read_sql("SELECT * FROM leads WHERE id = :id", conn, params={"id": lid})
+        
+        if df.empty: 
+            return "Lead not found. Please select a lead from Data View tab."
+        
+        r = df.iloc[0]
+        return html.Div([
+            html.B(r["customer_name"]), 
+            f" ({r['phone']}) - Status: {r['current_status']}"
+        ])
+    except Exception as e:
+        return f"Error loading lead: {str(e)}"
+
+@app.callback(
+    Output("call-history-area", "children"),
+    Input("selected-lead-id", "data"),
+)
+def update_call_history(lid):
+    """Display call history for selected lead"""
+    if not lid:
+        return html.Div("Select a lead to view call history.")
+    
+    try:
+        with READ_ENGINE.begin() as conn:
+            df = pd.read_sql(
+                "SELECT call_date, user_name, outcome, notes FROM call_logs WHERE lead_id = :lid ORDER BY call_date DESC LIMIT 10",
+                conn,
+                params={"lid": lid}
+            )
+        
+        if df.empty:
+            return html.Div("No call history yet.")
+        
+        history_items = []
+        for idx, row in df.iterrows():
+            history_items.append(html.Div([
+                html.B(f"{row['call_date']} - {row['outcome']}"),
+                html.Br(),
+                html.Small(f"By: {row['user_name']}"),
+                html.Br(),
+                html.Small(f"Notes: {row['notes'] or 'N/A'}"),
+                html.Hr()
+            ]))
+        
+        return html.Div(history_items)
+    except Exception as e:
+        return html.Div(f"Error loading history: {str(e)}")
 
 @app.callback(Output("workflow-pitch-dropdown", "options"), Input("current-user", "data"))
 def load_pitches(user):
@@ -610,10 +809,25 @@ def load_pitches(user):
 @app.callback(Output("selected-pitch-display", "value"), Input("workflow-pitch-dropdown", "value"))
 def show_pitch(p): return p or ""
 
-@app.callback(Output("workflow-status", "children"), Input("save-call-btn", "n_clicks"), State("selected-lead-id", "data"), State("current-user", "data"), State("call-date", "date"), State("remark-dropdown", "value"), State("workflow-pitch-dropdown", "value"), State("assign-to-dropdown", "value"), State("followup-date", "date"), State("call-notes", "value"), prevent_initial_call=True)
+@app.callback(
+    Output("workflow-status", "children"),
+    Input("save-call-btn", "n_clicks"),
+    State("selected-lead-id", "data"),
+    State("current-user", "data"),
+    State("call-date", "date"),
+    State("remark-dropdown", "value"),
+    State("workflow-pitch-dropdown", "value"),
+    State("assign-to-dropdown", "value"),
+    State("followup-date", "date"),
+    State("call-notes", "value"),
+    prevent_initial_call=True
+)
 def save_call(n, lid, user, cdate, remark, pitch, assign, fdate, notes):
+    """Saves call and keeps lead selected"""
     uname = cu_username(user)
-    if not lid or not remark: return "Select lead and remark."
+    if not lid or not remark: 
+        return "Select lead and remark."
+    
     @with_write_retry
     def _save():
         with WRITE_ENGINE.begin() as conn:
@@ -626,7 +840,8 @@ def save_call(n, lid, user, cdate, remark, pitch, assign, fdate, notes):
             elif remark == "Catalogue": create_reminders_for_catalogue(conn, lid, uname, dt.date.fromisoformat(cdate), cat_att)
             elif fdate: conn.execute(text("INSERT INTO reminders (lead_id, reminder_date, reminder_type, user_name) VALUES (:lid, :rdate, :rtype, :user)"), {"lid": lid, "rdate": fdate, "rtype": remark, "user": uname})
             conn.execute(text("UPDATE leads SET current_status=:s, last_call_date=:d, no_response_attempts=:nr, catalogue_attempts=:ca, is_active=:a, assigned_user=:au WHERE id=:id"), {"s": remark, "d": cdate, "nr": no_resp, "ca": cat_att, "a": active, "au": assign or lead["assigned_user"], "id": lid})
-            return "Call saved."
+            return "✓ Call saved successfully!"
+    
     return _save()
 
 # ---------------- FOLLOWUPS CALLBACKS ----------------
@@ -642,7 +857,6 @@ def save_call(n, lid, user, cdate, remark, pitch, assign, fdate, notes):
     State("followups-table", "data"),
     State("followup-remark", "value"),
     State("current-user", "data"),
-    prevent_initial_call=False
 )
 def update_followups(n_done, start_date, end_date, n_all, rows, data, remark, user):
     uname = cu_username(user)
@@ -673,7 +887,6 @@ def update_followups(n_done, start_date, end_date, n_all, rows, data, remark, us
     Input("report-date-filter", "start_date"),
     Input("report-date-filter", "end_date"),
     Input("refresh-reports-btn", "n_clicks"),
-    prevent_initial_call=False
 )
 def update_reports(start_date, end_date, n_clicks):
     try:
@@ -702,10 +915,25 @@ def handle_upload(contents, filename):
     try:
         content_type, content_string = contents.split(",")
         decoded = base64.b64decode(content_string)
-        df = pd.read_excel(io.BytesIO(decoded))
+        
+        df = None
+        for header_row in [0, 1, 2]:
+            try:
+                test_df = pd.read_excel(io.BytesIO(decoded), header=header_row)
+                cols_lower = [str(c).lower().strip() for c in test_df.columns]
+                if any('name' in c or 'customer' in c or 'phone' in c or 'mobile' in c for c in cols_lower):
+                    df = test_df
+                    break
+            except:
+                continue
+        
+        if df is None:
+            df = pd.read_excel(io.BytesIO(decoded))
+        
         insert_or_update_leads_from_df(df)
-        return f"Imported {len(df)} rows."
-    except Exception as e: return f"Error: {e}"
+        return dbc.Alert(f"✓ Successfully imported {len(df)} rows from {filename}", color="success")
+    except Exception as e:
+        return dbc.Alert(f"Error importing {filename}: {str(e)}", color="danger")
 
 @app.callback(Output("gsheet-status", "children"), Input("import-gsheet-btn", "n_clicks"), State("google-sheet-url", "value"), prevent_initial_call=True)
 def import_gsheet(n, url):
@@ -830,18 +1058,19 @@ def delete_all_leads_data(n, confirm_key, user):
         @with_write_retry
         def _delete():
             with WRITE_ENGINE.begin() as conn:
-                # Delete all reminders
                 result_reminders = conn.execute(text("DELETE FROM reminders"))
-                # Delete all call logs
                 result_logs = conn.execute(text("DELETE FROM call_logs"))
-                # Delete all leads
                 result_leads = conn.execute(text("DELETE FROM leads"))
+                
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='leads'"))
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='call_logs'"))
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='reminders'"))
 
                 return result_leads.rowcount, result_logs.rowcount, result_reminders.rowcount
 
         leads_deleted, logs_deleted, reminders_deleted = _delete()
         return dbc.Alert(
-            f"Successfully deleted: {leads_deleted} leads, {logs_deleted} call logs, {reminders_deleted} reminders. Users and templates preserved.",
+            f"Successfully deleted: {leads_deleted} leads, {logs_deleted} call logs, {reminders_deleted} reminders. ID counters reset. Users and templates preserved.",
             color="success"
         )
     except Exception as e:
@@ -869,19 +1098,23 @@ def master_reset_database(n, reset_key, user):
         @with_write_retry
         def _master_reset():
             with WRITE_ENGINE.begin() as conn:
-                # Delete all data
                 conn.execute(text("DELETE FROM reminders"))
                 conn.execute(text("DELETE FROM call_logs"))
                 conn.execute(text("DELETE FROM leads"))
                 conn.execute(text("DELETE FROM pitch_templates"))
                 conn.execute(text("DELETE FROM users"))
+                
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='leads'"))
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='call_logs'"))
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='reminders'"))
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='pitch_templates'"))
+                conn.execute(text("DELETE FROM sqlite_sequence WHERE name='users'"))
 
-                # Recreate default admin
                 hashed = bcrypt.hashpw("naved123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
                 conn.execute(text("INSERT INTO users (username, password, is_active, role) VALUES ('naved', :p, 1, 'admin')"), {"p": hashed})
 
         _master_reset()
-        return dbc.Alert("Master reset complete! All data deleted. Default admin restored (username: naved, password: naved123). Please refresh the page.", color="success")
+        return dbc.Alert("Master reset complete! All data deleted and ID counters reset. Default admin restored (username: naved, password: naved123). Please refresh the page.", color="success")
     except Exception as e:
         return dbc.Alert(f"Error during master reset: {str(e)}", color="danger")
 
